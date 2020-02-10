@@ -10,7 +10,7 @@ use beacon_chain::AttestationProcessingOutcome;
 use rand::Rng;
 use sloggers::{null::NullLoggerBuilder, Build};
 use std::sync::Arc;
-use store::{DiskStore, Store, StoreConfig};
+use store::{iter::StateRootsIterator, DiskStore, Store, StoreConfig};
 use tempfile::{tempdir, TempDir};
 use tree_hash::TreeHash;
 use types::test_utils::{SeedableRng, XorShiftRng};
@@ -318,6 +318,90 @@ fn epoch_boundary_state_attestation_processing() {
         }
     }
     assert!(checked_pre_fin);
+}
+
+#[test]
+fn delete_states() {
+    let db_path = tempdir().unwrap();
+    let store = get_store(&db_path);
+    let harness = get_harness(store.clone(), VALIDATOR_COUNT);
+
+    let unforked_blocks = 4 * E::slots_per_epoch();
+
+    // Finalize an initial portion of the chain.
+    harness.extend_chain(
+        unforked_blocks as usize,
+        BlockStrategy::OnCanonicalHead,
+        AttestationStrategy::AllValidators,
+    );
+
+    // Create a fork post-finalization.
+    let two_thirds = (VALIDATOR_COUNT / 3) * 2;
+    let honest_validators: Vec<usize> = (0..two_thirds).collect();
+    let faulty_validators: Vec<usize> = (two_thirds..VALIDATOR_COUNT).collect();
+
+    let fork_blocks = 2 * E::slots_per_epoch();
+
+    let (honest_head, faulty_head) = harness.generate_two_forks_by_skipping_a_block(
+        &honest_validators,
+        &faulty_validators,
+        fork_blocks as usize,
+        fork_blocks as usize,
+    );
+
+    // harness.chain.fork_choice().expect("fork choice OK");
+
+    assert!(honest_head != faulty_head, "forks should be distinct");
+    let head_info = harness.chain.head_info().expect("should get head");
+    assert_eq!(head_info.slot, unforked_blocks + fork_blocks);
+
+    assert_eq!(
+        head_info.block_root, honest_head,
+        "the honest chain should be the canonical chain",
+    );
+
+    let faulty_head_block = store
+        .get_block(&faulty_head)
+        .expect("no errors")
+        .expect("faulty head block exists");
+
+    let faulty_head_state = store
+        .get_state(&faulty_head_block.state_root, Some(faulty_head_block.slot))
+        .expect("no db error")
+        .expect("faulty head state exists");
+
+    let to_delete = StateRootsIterator::owned(store.clone(), faulty_head_state)
+        .take_while(|(_, slot)| *slot > unforked_blocks)
+        .collect::<Vec<_>>();
+
+    // Delete faulty fork
+    for (state_root, slot) in &to_delete {
+        assert_eq!(store.delete_state(state_root, *slot), Ok(()));
+    }
+
+    // Attempting to load those states now should find them unavailable
+    for (state_root, slot) in &to_delete {
+        assert_eq!(store.get_state(state_root, Some(*slot)), Ok(None));
+    }
+
+    // Double-deleting should also be OK (deleting non-existent things is fine)
+    for (state_root, slot) in &to_delete {
+        assert_eq!(store.delete_state(state_root, *slot), Ok(()));
+    }
+
+    // Deleting frozen states should do nothing
+    let split_slot = store.get_split_slot();
+    let finalized_states = harness
+        .chain
+        .rev_iter_state_roots()
+        .expect("rev iter ok")
+        .filter(|(_, slot)| *slot < split_slot);
+
+    for (state_root, slot) in finalized_states {
+        assert_eq!(store.delete_state(&state_root, slot), Ok(()));
+    }
+
+    check_chain_dump(&harness, unforked_blocks + fork_blocks + 1);
 }
 
 /// Check that the head state's slot matches `expected_slot`.
